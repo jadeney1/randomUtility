@@ -202,7 +202,13 @@ def data_gen(n):
         information[f"u{i}"] = information['lo'].apply(lambda x: 10*x.index(i))
     information['lo'] = information['lo'].apply(lambda x: x[::-1])
 
-    return information
+    menus = []
+    for i in range(2, n+1):
+        menus.extend(list(combinations(list(range(1,n+1)), i)))
+
+    menus = pd.Series(menus)
+
+    return menus
 
 
 
