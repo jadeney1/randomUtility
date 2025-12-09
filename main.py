@@ -4,7 +4,9 @@ from itertools import combinations
 from itertools import permutations
 from itertools import product
 from scipy.optimize import linprog
+from scipy.stats import norm
 import cvxpy as cp
+import math
 
 class ChoiceModel:
     def __init__(self, n):
@@ -194,22 +196,98 @@ class ChoiceModel:
     
 
 
-def data_gen(n):
-    alternatives = list(range(n))
-    linear_orders = list(permutations(alternatives, n))
-    information = pd.DataFrame({'lo': linear_orders})
-    for i in range(n):
-        information[f"u{i}"] = information['lo'].apply(lambda x: 10*x.index(i))
-    information['lo'] = information['lo'].apply(lambda x: x[::-1])
+class GenData:
+    DEFAULTS = {
+        "temp_min": 0,
+        "temp_max": 0,
+        "f_rational": 1,
+    }
 
-    menus = []
-    for i in range(2, n+1):
-        menus.extend(list(combinations(list(range(1,n+1)), i)))
+    allowed_kwargs = set(DEFAULTS.keys())
 
-    menus = pd.Series(menus)
+    def __init__(self, n_alternatives=4, **kwargs):
+        self.alternatives = list(range(n_alternatives))
+        self.linear_orders = list(permutations(self.alternatives, len(self.alternatives)))
+        
+        for key in kwargs:
+            if key not in self.allowed_kwargs:
+                raise ValueError(f"Unknown parameter: {key}")
 
-    return menus
+        params = {**self.DEFAULTS, **kwargs}
+
+        for key, value in params.items():
+            setattr(self, key, value)
+
+
+        self.rational_los, self.irrational_los = self.split()
+
+    def get_menus(self):
+        menus = []
+        for i in range(2, len(self.alternatives)+1):
+            menus.extend(combinations(self.alternatives, i))
+
+        return menus
+
+
+    def split(self):
+
+        number_rational = math.floor(self.f_rational*len(self.linear_orders))
+        if number_rational == 0:
+            rational_linearOrders = None
+            irrational_linearOrders = self.linear_orders
+        elif number_rational == len(self.linear_orders):
+            rational_linearOrders = self.linear_orders
+            irrational_linearOrders = None
+        else:
+            rational_linearOrders = np.random.choice(list(range(len(self.linear_orders))), size=number_rational, replace=False)
+            rational_linearOrders = [self.linear_orders[i] for i in rational_linearOrders]
+         
+            irrational_linearOrders = [order for order in self.linear_orders if order not in rational_linearOrders]
+
+        return rational_linearOrders, irrational_linearOrders
+    
+    def generate_rational(self):
+        los = self.rational_los
+        menus = self.get_menus()
+        rational_data = pd.DataFrame(columns=los, index=menus)
+        
+        rows = [(menu, alternative) for menu in rational_data.index for alternative in menu]
+        rational_data = pd.DataFrame(columns=los, index = pd.MultiIndex.from_tuples(rows))
+        for lo in los:
+            rank = {alt: i for i, alt in enumerate(lo)}
+            for menu in menus:
+                top_choice = min(menu, key = lambda x: rank[x])
+                for alt in menu:
+                    rational_data.at[(menu, alt), lo] = 1 if alt == top_choice else 0
+        
+        return rational_data
+    
+    def generate_all(self):
+        rational_data = self.generate_rational()
+        los = self.irrational_los
+        temperatures = [np.random.uniform(self.temp_min, self.temp_max) for _ in range(len(los))]
+        menu_alts = list(rational_data.index)
+        utilities = {}
+        for lo in los:
+            values = {}
+            for ind, alt in enumerate(lo[::-1]):
+                values[alt] = int(1*(ind+1))
+            utilities[lo] = values
+
+        irrational_data = pd.DataFrame(index = pd.MultiIndex.from_tuples(menu_alts), columns=los)
+
+        for row_index, row in irrational_data.iterrows():
+            for col_index, col in enumerate(irrational_data.columns):
+                row[col] = norm.cdf(utilities[col][row_index[1]], 0, 10*temperatures[col_index])
+        irrational_data = irrational_data.reset_index()
+        cols = [col for col in irrational_data.columns if col not in ['level_0', 'level_1']]
+        irrational_data[cols] = irrational_data[cols]/irrational_data.groupby(['level_0'])[cols].transform('sum')
+        irrational_data = irrational_data.set_index(['level_0', 'level_1'])
+        main = pd.concat([rational_data, irrational_data], axis=1)
+        return main
 
 
 
-print(data_gen(4))
+
+
+print(GenData(3, f_rational=0.95, temp_min=0.2, temp_max = 0.8).generate_all())
