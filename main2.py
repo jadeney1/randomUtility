@@ -233,7 +233,6 @@ class SolveRum():
 dt, info = GenData(3, f_rational=0, temp_min=0.2,temp_max=0.9).get_data()
 dt2 = GenDataUnconstrained(3).gen_data()
 
-
 values = list(SolveRum(dt['overall']).begin_solve())
 print(values)
 information_main = pd.DataFrame.from_dict(info, orient='columns')
