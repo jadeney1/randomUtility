@@ -7,14 +7,19 @@ from scipy.optimize import linprog
 from scipy.stats import norm
 import cvxpy as cp
 import math
+import random
+
+seed = 10
+np.random.seed(seed)
+random.seed(seed)
 
 class ChoiceModel:
-    def __init__(self, n):
-        self.n = n
-        self.X = list(range(1, n+1))
-        self.probs = self.simulate_probs()
-        self.rows = self.probs.index
-        self.columns = list(permutations(self.X))
+    def __init__(self, information_input):
+        self.n = information_input['n']
+        self.X = information_input['alternatives']
+        self.probs = information_input['probs']
+        self.rows = information_input['rows']
+        self.columns = information_input['columns']
         self.C = self.create_C()
         self.RationalRUM = self.trad_RUM()
 
@@ -198,9 +203,9 @@ class ChoiceModel:
 
 class GenData:
     DEFAULTS = {
-        "temp_min": 0,
-        "temp_max": 0,
-        "f_rational": 1,
+        "temp_min": 0.4,
+        "temp_max": 0.6,
+        "f_rational": 0.5,
     }
 
     allowed_kwargs = set(DEFAULTS.keys())
@@ -227,7 +232,6 @@ class GenData:
             menus.extend(combinations(self.alternatives, i))
 
         return menus
-
 
     def split(self):
 
@@ -266,6 +270,7 @@ class GenData:
         rational_data = self.generate_rational()
         los = self.irrational_los
         temperatures = [np.random.uniform(self.temp_min, self.temp_max) for _ in range(len(los))]
+        self.temp_sum = dict(zip(los, temperatures))
         menu_alts = list(rational_data.index)
         utilities = {}
         for lo in los:
@@ -284,10 +289,42 @@ class GenData:
         irrational_data[cols] = irrational_data[cols]/irrational_data.groupby(['level_0'])[cols].transform('sum')
         irrational_data = irrational_data.set_index(['level_0', 'level_1'])
         main = pd.concat([rational_data, irrational_data], axis=1)
+
         return main
 
+    def random_support(self):
+        supp = np.random.randint(0,100, size=len(self.linear_orders))
+        supp = [s/sum(supp) for s in supp]
+
+        return dict(zip(self.linear_orders, supp))
+
+    def get_data(self):
+        data = self.generate_all()
+        supports = self.random_support()
+        information = {}
+        for lo in data.columns:
+            info = {}
+            info['rational'] = lo in self.rational_los
+            info['temperature'] = 0 if lo in self.rational_los else self.temp_sum[lo]
+            info['support'] = supports[lo]
+            information[lo] = info
+
+        data_main = data.copy()
+        data_main['overall'] = data_main.apply(lambda row: np.dot(np.array(row), np.array(list(supports.values()))), axis=1)
+        
+        main_choice_data = data_main[['overall']]
+        main_choice_data = main_choice_data.reset_index()
+        main_choice_data.index = pd.MultiIndex.from_tuples(zip(main_choice_data['level_1'], main_choice_data['level_0']), names=['alternative', 'menu'])
+        main_choice_data = main_choice_data['overall']
+
+        info_main = {'data': main_choice_data, 
+                     'n': int(len(self.alternatives)), 
+                     'alternatives': self.alternatives, 
+                     'probs': pd.Series(main_choice_data.values),
+                     'rows': main_choice_data.index,
+                     'columns': self.linear_orders}
+        return info_main, information
 
 
-
-
-print(GenData(3, f_rational=0.95, temp_min=0.2, temp_max = 0.8).generate_all())
+dt, inf = GenData(3).get_data()
+print(ChoiceModel(dt).iterate())
