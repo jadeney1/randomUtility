@@ -8,197 +8,8 @@ from scipy.stats import norm
 import cvxpy as cp
 import math
 import random
+import ast
 
-seed = 10
-np.random.seed(seed)
-random.seed(seed)
-
-class ChoiceModel:
-    def __init__(self, information_input):
-        self.n = information_input['n']
-        self.X = information_input['alternatives']
-        self.probs = information_input['probs']
-        self.rows = information_input['rows']
-        self.columns = information_input['columns']
-        self.C = self.create_C()
-        self.RationalRUM = self.trad_RUM()
-
-    def simulate_probs(self, alpha=1.0):
-        menus = []
-        for r in range(2, len(self.X)+1):
-            menus.extend(combinations(self.X, r))
-        menu_probs = {}
-        for menu in menus: 
-            k = len(menu)
-            probs = np.random.dirichlet([alpha]*k)
-            menu_probs[menu] = dict(zip(menu, probs))
-
-        data = []
-        index = []
-
-        for menu, probs in menu_probs.items():
-            for alt, p in probs.items():
-                index.append((alt, menu))
-                data.append(p)
-        idx = pd.MultiIndex.from_tuples(index, names=['alternative', 'menu'])
-
-        return pd.Series(data, index=idx, name='choice_probability').sort_index(level='menu')
-        
-    def create_C(self):
-        idx = []
-        for alternative, menu in self.rows:
-            for ranking in self.columns:
-                rank_int = tuple(a for a in ranking if a in menu)
-                if rank_int.index(alternative) == 0:
-                    idx.append((alternative, menu, ranking, 1))
-                else:
-                    idx.append((alternative, menu, ranking, 0))
-        alt_main = [item[0] for item in idx]
-        menu_main = [item[1] for item in idx]
-        ranking_main = [item[2] for item in idx]
-        choice_main = [item[3] for item in idx]
-        C = pd.DataFrame({'alternative': alt_main, 'menu': menu_main, 'ranking': ranking_main, 'choice': choice_main})
-        C = C.pivot(index=['alternative', 'menu'], columns='ranking', values='choice')
-        C = C.sort_index(level ='menu')
-
-        return C
-    
-    def trad_RUM(self):
-        C = self.C.to_numpy()
-        p = self.probs.to_numpy().reshape(-1, 1)
-
-        n = C.shape[1]
-        c = np.zeros(n)
-        bounds = [[0,1] for _ in range(n)]
-        C_eq = np.vstack([C, np.ones(n)])
-        p_eq = np.append(p, 1)
-
-        res = linprog(c, A_eq=C_eq, b_eq=p_eq, bounds=bounds, method='highs')
-        
-        return res.success
-    
-    def generate_mistake_functions(self, df, col, d):
-        menus = df.index.get_level_values("menu").unique()
-
-        true_choice = {
-            m: df[col].xs(m, level="menu").idxmax()
-            for m in menus
-        }
-
-        mistake_alts = {
-            m: [a for a in df[col].xs(m, level="menu").index if a != true_choice[m]]
-            for m in menus
-        }
-
-        all_cf = []  
-
-        for mistaken_menus in combinations(menus, d):
-
-            wrong_lists = [mistake_alts[m] for m in mistaken_menus]
-
-            for wrong_combo in product(*wrong_lists):
-
-                cf = {}
-                wrong_map = dict(zip(mistaken_menus, wrong_combo))
-
-                for m in menus:
-                    if m in wrong_map:
-                        cf[m] = wrong_map[m]         
-                    else:
-                        cf[m] = true_choice[m]       
-
-                all_cf.append(cf)
-
-        return all_cf
-
-    def mistake_df(self, df, col, d):
-
-        mistake_functions = self.generate_mistake_functions(df, col, d)
-
-        new_cols = []
-        new_data = []
-
-        for i, cf in enumerate(mistake_functions):
-            col_name = f"m_{str(col)}_{d}_{i}"  
-            new_cols.append(col_name)
-
-            col_values = []
-
-            for (alt, menu) in df.index:    
-                chosen = cf[menu]           
-                col_values.append(1 if alt == chosen else 0)
-
-            new_data.append(col_values)
-
-        new_df = pd.DataFrame(
-            np.column_stack(new_data),
-            index=df.index,
-            columns=new_cols
-        )
-
-        return new_df
-    
-    def create_Ci(self, d=1):
-        C = self.C
-        main = pd.DataFrame()
-        irr = pd.DataFrame()
-        for i in range(1, d+1):
-            for ranking in C.columns:
-                irr = pd.concat([irr, self.mistake_df(C, ranking, i)], axis=1)
-            main = pd.concat([main, irr], axis=1)
-        nCols = [int(col.split("_")[2]) for col in main.columns]
-        return main, nCols
-
-    def solve(self, depth=0):
-        if depth==0:
-            s = self.trad_RUM()
-            info = None
-        else:    
-            s = False
-            C = self.C
-            
-            C_i, levels = self.create_Ci(d=depth)
-            rho = self.probs
-            m, n = C.shape
-            _, k = C_i.shape
-
-            allLevels = [0]*n + levels
-            allLevels = [100**(1/(l+1)) for l in allLevels]
-
-            main = pd.concat([C, C_i], axis=1)
-
-            w = -1*np.array(allLevels)
-
-            A_eq = main.to_numpy()
-            b_eq = rho.to_numpy()
-            A_eq_sum = np.ones((1, n+k))
-            b_eq_sum = np.array([1])
-
-            A_eq_total = np.vstack([A_eq, A_eq_sum])
-            b_eq_total = np.concatenate([b_eq, b_eq_sum])
-
-            bounds = [(0,1)]*(n+k)
-
-            result = linprog(w, A_eq = A_eq_total, b_eq = b_eq_total, bounds=bounds, method='highs')
-            s = result.success
-            if result.success:
-                r = pd.DataFrame({'lo': [item1 for item1, _ in zip(list(main.columns), list(result.x))], 'weight': [float(item2) for _, item2 in zip(list(main.columns), list(result.x))]})
-                #r['exp_level'] = r['lo'].apply(lambda x: 0 if x in C.columns else levels[x])
-                info = r
-            else:
-                info = None
-
-        return s, info
-    
-    def iterate(self):
-        depth = -1
-        success = False
-        while not success:
-            depth += 1
-            success, data = self.solve(depth=depth)
-            
-        return data
-    
 
 
 class GenData:
@@ -225,12 +36,12 @@ class GenData:
 
 
         self.rational_los, self.irrational_los = self.split()
+        self.menus = self.get_menus()
 
     def get_menus(self):
         menus = []
         for i in range(2, len(self.alternatives)+1):
             menus.extend(combinations(self.alternatives, i))
-
         return menus
 
     def split(self):
@@ -252,44 +63,43 @@ class GenData:
     
     def generate_rational(self):
         los = self.rational_los
-        menus = self.get_menus()
-        rational_data = pd.DataFrame(columns=los, index=menus)
+        alt_menu = [(alt, menu) for menu in self.menus for alt in menu]
+        rational_df = pd.DataFrame(index=pd.MultiIndex.from_tuples(alt_menu), columns=los)
+        for (alt, menu) in rational_df.index:
+            for lo in rational_df.columns:
+                rank = [a for a in lo if a in menu]
+                rational_df.at[(alt, menu), lo] = 1 if rank[0] == alt else 0
         
-        rows = [(menu, alternative) for menu in rational_data.index for alternative in menu]
-        rational_data = pd.DataFrame(columns=los, index = pd.MultiIndex.from_tuples(rows))
-        for lo in los:
-            rank = {alt: i for i, alt in enumerate(lo)}
-            for menu in menus:
-                top_choice = min(menu, key = lambda x: rank[x])
-                for alt in menu:
-                    rational_data.at[(menu, alt), lo] = 1 if alt == top_choice else 0
-        
-        return rational_data
+        return rational_df
     
     def generate_all(self):
-        rational_data = self.generate_rational()
-        los = self.irrational_los
-        temperatures = [np.random.uniform(self.temp_min, self.temp_max) for _ in range(len(los))]
-        self.temp_sum = dict(zip(los, temperatures))
-        menu_alts = list(rational_data.index)
-        utilities = {}
-        for lo in los:
-            values = {}
-            for ind, alt in enumerate(lo[::-1]):
-                values[alt] = int(1*(ind+1))
-            utilities[lo] = values
-
-        irrational_data = pd.DataFrame(index = pd.MultiIndex.from_tuples(menu_alts), columns=los)
-
-        for row_index, row in irrational_data.iterrows():
-            for col_index, col in enumerate(irrational_data.columns):
-                row[col] = norm.cdf(utilities[col][row_index[1]], 0, 10*temperatures[col_index])
-        irrational_data = irrational_data.reset_index()
-        cols = [col for col in irrational_data.columns if col not in ['level_0', 'level_1']]
-        irrational_data[cols] = irrational_data[cols]/irrational_data.groupby(['level_0'])[cols].transform('sum')
-        irrational_data = irrational_data.set_index(['level_0', 'level_1'])
-        main = pd.concat([rational_data, irrational_data], axis=1)
-
+        menu_alts = [(alt, menu) for menu in self.menus for alt in menu]
+        if self.f_rational != 0:
+            rational_df = self.generate_rational()
+        if self.f_rational != 1:
+            irrational_los = self.irrational_los
+            temperatures = [random.uniform(self.temp_min, self.temp_max) for _ in self.irrational_los]
+            temperatures = dict(zip(irrational_los, temperatures))
+            self.temperatures = temperatures
+            # create dict for all utilities 
+            utilities = {}
+            for lo in irrational_los:
+                inf = {}
+                for i,alt in enumerate(lo[::-1]):
+                    inf[alt] = i+1
+                utilities[lo] = inf
+            # make irrational df
+            irrational_df = pd.DataFrame(index=pd.MultiIndex.from_tuples(menu_alts), columns=irrational_los)
+            for row_i, row in irrational_df.iterrows():
+                for col_i, col in enumerate(irrational_df.columns):
+                    row[col] = norm.cdf(utilities[col][row_i[0]], 0, temperatures[col])
+            irrational_df = irrational_df.groupby(level=1).transform(lambda x: x/x.sum())
+        if self.f_rational == 1:
+            main = rational_df
+        elif self.f_rational == 0:
+            main = irrational_df
+        else:
+            main = pd.concat([rational_df, irrational_df], axis=1)
         return main
 
     def random_support(self):
@@ -301,30 +111,218 @@ class GenData:
     def get_data(self):
         data = self.generate_all()
         supports = self.random_support()
+        data['overall'] = data.apply(lambda row: np.dot(np.array(row), np.array(list(supports.values()))), axis=1)
         information = {}
-        for lo in data.columns:
-            info = {}
-            info['rational'] = lo in self.rational_los
-            info['temperature'] = 0 if lo in self.rational_los else self.temp_sum[lo]
-            info['support'] = supports[lo]
-            information[lo] = info
+        for lo in [col for col in data.columns if col != 'overall']:
+            inf = {}
+            if self.f_rational != 0:
+                inf['rational'] = lo in self.rational_los
+                inf['temperature'] = None if lo in self.rational_los else self.temperatures[lo]
+            else:
+                inf['rational'] = False
+                inf['temperature'] = self.temperatures[lo]
+            inf['support'] = supports[lo]
+            information[str(lo)] = inf
+        return data, pd.DataFrame(information)
 
-        data_main = data.copy()
-        data_main['overall'] = data_main.apply(lambda row: np.dot(np.array(row), np.array(list(supports.values()))), axis=1)
+class GenDataUnconstrained():
+    def __init__(self, n_alternatives=4):
+        self.n_alternatives = n_alternatives
+        self.alternatives = list(range(self.n_alternatives))
+        self.columns = list(permutations(self.alternatives, self.n_alternatives))
+        menus = []
+        for i in range(2, self.n_alternatives + 1):
+            menus.extend(list(combinations(self.alternatives, i)))
+
+        self.rows = [(alt, menu) for menu in menus for alt in menu]
+
+    def gen_data(self):
+        data_frame = pd.DataFrame(index = pd.MultiIndex.from_tuples(self.rows), columns=self.columns)
+        data_frame = data_frame.map(lambda x: random.uniform(0,1))
+        data_frame = data_frame.groupby(level=1).transform(lambda x: x/x.sum())
+
+        support = [random.uniform(0,10) for _ in range(data_frame.shape[1])]
+        support = [s/sum(support) for s in support]
+        data_frame['overall'] = data_frame.apply(lambda row: np.dot(np.array(row), np.array(support)), axis=1)
+        self.support = dict(zip(data_frame.columns, support))
+        information = {}
+        for lo in [col for col in data_frame.columns if col != 'overall']:
+            inf = {}
+            inf['rational'] = False
+            inf['temperature'] = None
+            inf['support'] = self.support[lo]
+            information[str(lo)] = inf
+
+        return data_frame, pd.DataFrame.from_dict(information)
+
+class GenDataAlmostRational():
+    def __init__(self, n_alternatives = 4, f_rational=0.5):
+        self.n_alternatives = n_alternatives
+        self.alternatives = list(range(self.n_alternatives))
+        self.f_rational = f_rational
+
+    def data_rational(self):
+        menus = []
+        for i in range(2, self.n_alternatives + 1):
+            menus.extend(combinations(self.alternatives, i))
         
-        main_choice_data = data_main[['overall']]
-        main_choice_data = main_choice_data.reset_index()
-        main_choice_data.index = pd.MultiIndex.from_tuples(zip(main_choice_data['level_1'], main_choice_data['level_0']), names=['alternative', 'menu'])
-        main_choice_data = main_choice_data['overall']
+        rows = [(alt, menu) for menu in menus for alt in menu]
+        cols = list(permutations(self.alternatives, self.n_alternatives))
+        df = pd.DataFrame(index=pd.MultiIndex.from_tuples(rows), columns=cols)
+        for indx, row in df.iterrows():
+            for col in df.columns:
+                rnk = [a for a in col if a in indx[1]]
+                row[col] = 1 if indx[0] == rnk[0] else 0
+        return df
+    
+    def data_irrational(self):
+        df = self.data_rational()
+        if self.f_rational == 1:
+            pass
+        else:
+            n_irrational = math.floor((1-self.f_rational)*df.shape[1])
+            irrational_orders = random.choices(list(df.columns), k=n_irrational)
+            self.irrational_orders = irrational_orders
+            for order in irrational_orders:
+                menus = pd.DataFrame({'menu':df.index.get_level_values(1)}).drop_duplicates()
+                menus['choice'] = menus['menu'].apply(lambda x: random.choice(x))
+                values = list(zip(menus['menu'], menus['choice']))
+                for idx, row in df.iterrows():
+                    row[order] = 1 if (idx[1], idx[0]) in values else 0
 
-        info_main = {'data': main_choice_data, 
-                     'n': int(len(self.alternatives)), 
-                     'alternatives': self.alternatives, 
-                     'probs': pd.Series(main_choice_data.values),
-                     'rows': main_choice_data.index,
-                     'columns': self.linear_orders}
-        return info_main, information
+        return df 
+
+    def support(self):
+        df = self.data_irrational()
+        weights = [random.uniform(0, 10) for _ in range(df.shape[1])]
+        weights = [w/sum(weights) for w in weights]
+        support = dict(zip(df.columns, weights))
+        df['overall'] = df.apply(lambda row: np.dot(np.array(row), np.array(weights)), axis=1)
+        information = {}
+        for lo in [col for col in df.columns if col != 'overall']:
+            inf = {}
+            inf['rational'] = lo not in self.irrational_orders
+            inf['temperature'] = None
+            inf['support'] = support[lo]
+            information[str(lo)] = inf
+        return df, pd.DataFrame.from_dict(information)            
+                
+class SolveRum():
+    def __init__(self, data):
+        self.main_index = data.index
+        self.alternatives = list(set([item1 for item1, _ in data.index]))
+        self.menus = list(set([item2 for _, item2 in data.index]))
+        self.main_columns = list(permutations(self.alternatives, len(self.alternatives)))
+        self.data = data
+
+    def generate_matrix(self, depth=0):
+        rational_matrix = pd.DataFrame(index = self.main_index, columns = self.main_columns)
+        for (alt, menu) in rational_matrix.index:
+            for lo in rational_matrix.columns:
+                rnk = [a for a in lo if a in menu]
+                rational_matrix.at[(alt, menu), lo] = 1 if alt == rnk[0] else 0
+        if depth == 0:
+            main_return = rational_matrix
+        else:
+            main_return = self.generate_exp_matrix(rational_matrix, self.menus, depth=depth)
+
+        return main_return
+    
+    def generate_exp_matrix(self, rational_df, menus, depth=1):
+        menu_rows = {menu: [(alt, menu) for alt in menu] for menu in menus}
+        new_columns = {}
+        for col in rational_df.columns:
+            for mistake_menus in combinations(menus, depth):    
+                new_col = rational_df[col].copy()
+                for menu in mistake_menus:
+                    rows = menu_rows[menu] 
+                    chosen_row = [r for r in rows if new_col[r] == 1][0]
+                    chosen_alt = chosen_row[0]
+                    wrong_alts = [a for a in menu if a != chosen_alt]
+                    for wrong_alt in wrong_alts:
+                        wrong_row = (wrong_alt, menu)
+                        col_name = f"{col}_menu={menu}_mistake_to={wrong_alt}"
+                        temp_col = new_col.copy()
+                        temp_col[chosen_row] = 0
+                        temp_col[wrong_row] = 1
+                        new_columns[col_name] = temp_col
+
+        mistake_df = pd.DataFrame(new_columns)
+        mistake_df = mistake_df.loc[:, ~mistake_df.T.duplicated()]
+        
+        return mistake_df
+    
+    def begin_solve(self):
+        d = 0
+        success = False
+        while not success:
+            mat_main = pd.DataFrame()
+            weights = []
+            for i in range(d+1):
+                new_mat = self.generate_matrix(i)
+                weights = weights + [np.exp(i+1)]*new_mat.shape[1]
+                mat_main = pd.concat([mat_main, new_mat], axis=1)
+            max_support = mat_main.shape[1]
+            weights = [10*(max(weights)+1 - w) for w in weights]
+            w = -1*np.array(weights)
+
+            A_eq = mat_main.to_numpy()
+            b_eq = self.data.to_numpy()
+            A_eq_sum = np.ones((1, max_support))
+            b_eq_sum = np.array([1])
+
+            A_eq_total = np.vstack([A_eq, A_eq_sum])
+            b_eq_total = np.concatenate([b_eq, b_eq_sum])
+
+            bounds = [(0,1)]*(max_support)
+
+            result = linprog(w, A_eq = A_eq_total, b_eq = b_eq_total, bounds=bounds, method='highs')
+            if not result.success:
+                d += 1
+            else:
+                values = result.x
+
+            success = result.success
+        inf = dict(zip(mat_main.columns, values))
+        inf2 = {}
+        for i, entry in enumerate(inf):
+            if isinstance(entry, tuple):
+                n = {}
+                n['rationalWeight'] = float(inf[entry])
+                n['irrationalWeight'] = 0
+                inf2[str(entry)] = n
+            else:
+                names = [a for a in entry.split('_')]
+                lo = names[0]
+                if lo in inf2.keys():
+                    inf2[lo]['irrationalWeight'] = inf2[lo]['irrationalWeight'] + inf[entry]
+        return pd.DataFrame.from_dict(inf2)
+
+df1, inf1 = GenData(n_alternatives=3, f_rational=0.5).get_data()
+df2, inf2 = GenDataUnconstrained(n_alternatives=3).gen_data()
+df3, inf3 = GenDataAlmostRational(n_alternatives=3, f_rational=0.5).support()
+
+res1 = SolveRum(df1['overall']).begin_solve()
+res2 = SolveRum(df2['overall']).begin_solve()
+res3 = SolveRum(df3['overall']).begin_solve()
 
 
-dt, inf = GenData(3).get_data()
-print(ChoiceModel(dt).iterate())
+main = pd.DataFrame(columns=['rational', 'temperature', 'support', 'rationalWeight', 'irrationalWeight'])
+
+for n in [3,4,5]:
+    for i in range(1000):
+        if i % 10 ==0:
+            print(i)
+        f_rat = random.randint(1,99)/100
+        df_main, inf_main = GenDataAlmostRational(n_alternatives=n, f_rational=f_rat).support()
+        res_main = SolveRum(df_main['overall']).begin_solve()
+        new = pd.concat([inf_main, res_main]).T
+        new['f_rational'] = f_rat
+        new['n_alternatives'] = n
+        new.index = [str(ind) + '_' + str(i) for ind in new.index]
+        main = pd.concat([main, new], axis=0)
+
+main['totalWeight'] = main[['rationalWeight', 'irrationalWeight']].sum(axis=1)
+
+main.to_csv("/Users/jackadeney/Library/CloudStorage/Dropbox/randomUtility/simulatedData.csv")
+
