@@ -35,7 +35,7 @@ plt.close()
 check2 = main.groupby(['rational', 'f_rational', 'n_alternatives'])[['rationalWeight', 'irrationalWeight', 'totalWeight']].agg('mean').reset_index()
 check2['colors'] = check2['rational'].map({True: 'blue', False: 'red'})
 
-fix, axes = plt.subplots(3, 2, figsize=(12,4))
+fig, axes = plt.subplots(3, 2, figsize=(12,4))
 labs = {'rationalWeight': 'Rational Weight', 'irrationalWeight': 'Irrational Weight'}
 
 for j, variable in enumerate(['rationalWeight', 'irrationalWeight']):
